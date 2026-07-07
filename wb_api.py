@@ -2,6 +2,7 @@ import requests
 import pandas as pd
 from datetime import datetime, timedelta
 import streamlit as st
+import time
 
 
 BASE_STATISTICS = "https://statistics-api.wildberries.ru"
@@ -12,17 +13,60 @@ def get_headers(api_key):
     return {"Authorization": api_key}
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+def make_request_with_retry(url, headers, params=None, max_retries=3, initial_delay=5):
+    """Делает запрос с повторными попытками при 429 ошибке"""
+
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=90)
+
+            if response.status_code == 200:
+                return response, None
+
+            if response.status_code == 429:
+                wait_time = initial_delay * (attempt + 1) * 12
+                if attempt < max_retries - 1:
+                    with st.spinner(f"⏳ WB просит подождать... ({wait_time} сек)"):
+                        time.sleep(wait_time)
+                    continue
+                else:
+                    return None, "429"
+
+            if response.status_code == 401:
+                return None, "401"
+
+            return None, f"HTTP {response.status_code}"
+
+        except requests.exceptions.Timeout:
+            if attempt < max_retries - 1:
+                time.sleep(5)
+                continue
+            return None, "timeout"
+        except Exception as e:
+            return None, str(e)
+
+    return None, "max_retries"
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_orders(api_key, date_from):
     """Получить заказы с указанной даты"""
     url = f"{BASE_STATISTICS}/api/v1/supplier/orders"
     params = {"dateFrom": date_from}
 
-    try:
-        response = requests.get(url, headers=get_headers(api_key), params=params, timeout=60)
-        response.raise_for_status()
-        data = response.json()
+    response, error = make_request_with_retry(url, get_headers(api_key), params)
 
+    if error:
+        if error == "401":
+            st.error("❌ Неверный API ключ")
+        elif error == "429":
+            st.warning("⚠️ WB ограничил запросы. Данные заказов не загружены. Подожди 1-2 минуты и обнови.")
+        else:
+            st.error(f"❌ Ошибка получения заказов: {error}")
+        return pd.DataFrame()
+
+    try:
+        data = response.json()
         if not data:
             return pd.DataFrame()
 
@@ -30,31 +74,32 @@ def get_orders(api_key, date_from):
         df["date"] = pd.to_datetime(df["date"])
         df["date_only"] = df["date"].dt.date
         return df
-
-    except requests.exceptions.HTTPError as e:
-        if response.status_code == 401:
-            st.error("❌ Неверный API ключ")
-        elif response.status_code == 429:
-            st.error("❌ Слишком много запросов. Подожди минуту.")
-        else:
-            st.error(f"❌ Ошибка API: {e}")
-        return pd.DataFrame()
     except Exception as e:
-        st.error(f"❌ Ошибка получения заказов: {e}")
+        st.error(f"❌ Ошибка обработки заказов: {e}")
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_sales(api_key, date_from):
     """Получить продажи с указанной даты"""
+    time.sleep(3)  # Задержка между запросами
+
     url = f"{BASE_STATISTICS}/api/v1/supplier/sales"
     params = {"dateFrom": date_from}
 
-    try:
-        response = requests.get(url, headers=get_headers(api_key), params=params, timeout=60)
-        response.raise_for_status()
-        data = response.json()
+    response, error = make_request_with_retry(url, get_headers(api_key), params)
 
+    if error:
+        if error == "401":
+            st.error("❌ Неверный API ключ")
+        elif error == "429":
+            st.warning("⚠️ WB ограничил запросы. Данные продаж не загружены. Подожди 1-2 минуты и обнови.")
+        else:
+            st.error(f"❌ Ошибка получения продаж: {error}")
+        return pd.DataFrame()
+
+    try:
+        data = response.json()
         if not data:
             return pd.DataFrame()
 
@@ -63,44 +108,46 @@ def get_sales(api_key, date_from):
         df["date_only"] = df["date"].dt.date
         df["is_return"] = df["saleID"].str.startswith("R", na=False)
         return df
-
-    except requests.exceptions.HTTPError as e:
-        if response.status_code == 401:
-            st.error("❌ Неверный API ключ")
-        elif response.status_code == 429:
-            st.error("❌ Слишком много запросов. Подожди минуту.")
-        else:
-            st.error(f"❌ Ошибка API: {e}")
-        return pd.DataFrame()
     except Exception as e:
-        st.error(f"❌ Ошибка получения продаж: {e}")
+        st.error(f"❌ Ошибка обработки продаж: {e}")
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_stocks(api_key, date_from):
-    """Получить остатки"""
+    """Получить остатки (ограничение WB: 1 запрос в минуту)"""
+    time.sleep(5)  # Пауза перед запросом остатков
+
     url = f"{BASE_STATISTICS}/api/v1/supplier/stocks"
     params = {"dateFrom": date_from}
 
-    try:
-        response = requests.get(url, headers=get_headers(api_key), params=params, timeout=60)
-        response.raise_for_status()
-        data = response.json()
+    response, error = make_request_with_retry(
+        url, get_headers(api_key), params,
+        max_retries=2, initial_delay=10
+    )
 
+    if error:
+        if error == "429":
+            st.info("ℹ️ Остатки временно недоступны (WB ограничивает 1 запрос в минуту). Попробуй через 1-2 минуты.")
+        else:
+            st.warning(f"⚠️ Не удалось загрузить остатки: {error}")
+        return pd.DataFrame()
+
+    try:
+        data = response.json()
         if not data:
             return pd.DataFrame()
-
         return pd.DataFrame(data)
-
     except Exception as e:
-        st.error(f"❌ Ошибка получения остатков: {e}")
+        st.warning(f"⚠️ Ошибка обработки остатков: {e}")
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_advert_costs(api_key, date_from, date_to):
     """Получить расходы на рекламу по дням"""
+    time.sleep(2)
+
     url = f"{BASE_ADVERT}/adv/v1/upd"
 
     try:
@@ -123,7 +170,7 @@ def get_advert_costs(api_key, date_from, date_to):
 
         return pd.DataFrame()
 
-    except Exception as e:
+    except Exception:
         return pd.DataFrame()
 
 
@@ -250,7 +297,7 @@ def load_wb_data(api_key, days):
     with st.spinner("💰 Загружаем продажи..."):
         sales_df = get_sales(api_key, date_from)
 
-    with st.spinner("📊 Загружаем остатки..."):
+    with st.spinner("📊 Загружаем остатки (медленно из-за WB)..."):
         stocks_df = get_stocks(api_key, date_from)
 
     with st.spinner("📣 Загружаем расходы на рекламу..."):
