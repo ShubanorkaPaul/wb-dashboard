@@ -64,10 +64,68 @@ with st.sidebar:
             st.warning("⚠️ Введи API ключ")
 
     st.markdown("---")
+
+    # ===== ЗАГРУЗКА СЕБЕСТОИМОСТИ =====
+    st.subheader("💰 Себестоимость")
+
+    cost_file = st.file_uploader(
+        "Загрузить файл",
+        type=["xlsx", "xls", "csv"],
+        help="Excel с колонками: Артикул | Себестоимость"
+    )
+
+    if cost_file:
+        try:
+            if cost_file.name.endswith(".csv"):
+                cost_df = pd.read_csv(cost_file)
+            else:
+                cost_df = pd.read_excel(cost_file)
+
+            cols = list(cost_df.columns)
+            article_col = None
+            cost_col = None
+
+            for c in cols:
+                c_lower = str(c).lower().strip()
+                if article_col is None and ("артикул" in c_lower or "article" in c_lower or "sku" in c_lower):
+                    article_col = c
+                if cost_col is None and ("себест" in c_lower or "cost" in c_lower or "закуп" in c_lower):
+                    cost_col = c
+
+            if article_col and cost_col:
+                new_costs = {}
+                for _, row in cost_df.iterrows():
+                    art = str(row[article_col]).strip()
+                    try:
+                        cost = float(str(row[cost_col]).replace(",", ".").replace(" ", ""))
+                        if art and art.lower() != "nan" and cost > 0:
+                            new_costs[art] = cost
+                    except:
+                        pass
+
+                if new_costs:
+                    st.session_state["cost_prices"] = new_costs
+                    st.success(f"✅ Загружено {len(new_costs)} товаров")
+                else:
+                    st.error("❌ Не удалось прочитать данные")
+            else:
+                st.error(f"❌ Не найдены колонки. Доступные: {cols}")
+        except Exception as e:
+            st.error(f"❌ Ошибка: {e}")
+
+    saved_costs = st.session_state.get("cost_prices", {})
+    if saved_costs:
+        st.info(f"💾 В памяти: {len(saved_costs)} товаров")
+        if st.button("🗑️ Очистить себестоимость", use_container_width=True):
+            st.session_state["cost_prices"] = {}
+            st.rerun()
+
+    st.markdown("---")
     st.caption("🔄 Обновлено: " + datetime.now().strftime("%H:%M:%S"))
 
-    if st.button("🔄 Обновить данные", use_container_width=True):
+    if st.button("🔄 Очистить кеш и обновить", use_container_width=True):
         st.cache_data.clear()
+        st.session_state["wb_data_loaded"] = False
         st.rerun()
 
 
@@ -84,8 +142,25 @@ elif data_source == "🔌 WB API":
         st.warning("👈 Введи API ключ в боковой панели чтобы загрузить данные")
         st.stop()
 
+    col_load1, col_load2 = st.columns([1, 3])
+    with col_load1:
+        load_button = st.button("🚀 Загрузить данные из WB", type="primary", use_container_width=True)
+
+    with col_load2:
+        st.info("⏱️ Загрузка занимает 30-60 секунд. Данные кешируются на 30-60 минут.")
+
+    if "wb_data_loaded" not in st.session_state:
+        st.session_state["wb_data_loaded"] = False
+
+    if load_button:
+        st.session_state["wb_data_loaded"] = True
+
+    if not st.session_state["wb_data_loaded"]:
+        st.stop()
+
     try:
-        df_daily, df_products = load_wb_data(api_key, days)
+        current_costs = st.session_state.get("cost_prices", {})
+        df_daily, df_products = load_wb_data(api_key, days, current_costs)
 
         if df_daily.empty or df_daily["sales_sum"].sum() == 0:
             st.warning("⚠️ Нет данных за выбранный период. Попробуй увеличить период.")
@@ -105,6 +180,7 @@ total_profit = current_period["profit"].sum()
 total_ads = current_period["advertising"].sum()
 total_returns = current_period["returns_count"].sum()
 total_sales = current_period["sales_count"].sum()
+total_cost = current_period["cost_price"].sum()
 
 buyout_rate = (total_sales / total_orders * 100) if total_orders > 0 else 0
 avg_check = (total_revenue / total_sales) if total_sales > 0 else 0
@@ -176,6 +252,11 @@ with col8:
     st.metric("↩️ % возвратов", f"{return_rate:.1f}%")
 
 
+# Предупреждение если нет себестоимости
+if total_cost == 0 and data_source == "🔌 WB API":
+    st.warning("⚠️ Себестоимость не загружена. Прибыль считается без учёта закупочной цены. Загрузи файл в боковой панели.")
+
+
 st.markdown("---")
 
 
@@ -233,6 +314,7 @@ with col_left:
         "Логистика": current_period["logistics"].sum(),
         "Реклама": current_period["advertising"].sum(),
         "Эквайринг": current_period["acquiring"].sum(),
+        "Себестоимость": current_period["cost_price"].sum(),
     }
 
     expenses = {k: v for k, v in expenses.items() if v > 0}
@@ -279,15 +361,38 @@ with col_right:
 st.markdown("---")
 
 
-st.subheader("🏆 ТОП товаров по выручке")
+st.subheader("🏆 ТОП товаров по прибыли")
 
 if not df_products.empty:
-    df_top = df_products.head(10).copy()
+    df_top = df_products.head(15).copy()
     df_top.index = df_top.index + 1
-    df_top_display = df_top[["article", "name", "sold", "revenue", "profit", "stock"]].copy()
-    df_top_display.columns = ["Артикул", "Название", "Продано, шт", "Выручка, ₽", "Прибыль, ₽", "Остаток"]
 
-    st.dataframe(df_top_display, use_container_width=True, height=400)
+    df_top_display = df_top[[
+        "article", "name", "sold", "revenue",
+        "cost_per_unit", "cost_price_total", "profit", "stock"
+    ]].copy()
+    df_top_display.columns = [
+        "Артикул", "Название", "Продано", "Выручка ₽",
+        "Себест. за ед.", "Себест. всего", "Прибыль ₽", "Остаток"
+    ]
+
+    st.dataframe(df_top_display, use_container_width=True, height=500)
+
+    with_cost = df_products[df_products["has_cost"]].shape[0]
+    without_cost = df_products[~df_products["has_cost"]].shape[0]
+
+    col_stat1, col_stat2 = st.columns(2)
+    with col_stat1:
+        st.info(f"✅ С себестоимостью: **{with_cost}** товаров")
+    with col_stat2:
+        if without_cost > 0:
+            st.warning(f"⚠️ Без себестоимости: **{without_cost}** товаров (прибыль неточная)")
+
+    if without_cost > 0:
+        with st.expander(f"📋 Показать {without_cost} товаров без себестоимости"):
+            missing = df_products[~df_products["has_cost"]][["article", "name", "sold", "revenue"]]
+            missing.columns = ["Артикул", "Название", "Продано", "Выручка"]
+            st.dataframe(missing, use_container_width=True)
 else:
     st.info("Нет данных о товарах")
 
@@ -300,6 +405,18 @@ st.subheader("🔔 Уведомления")
 col_a, col_b, col_c = st.columns(3)
 
 with col_a:
+    st.markdown("### 🚨 Убыточные товары")
+    if not df_products.empty:
+        unprofitable = df_products[(df_products["profit"] < 0) & (df_products["has_cost"])]
+        if len(unprofitable) > 0:
+            for _, row in unprofitable.head(5).iterrows():
+                st.error(f"**{row['article']}** — убыток {abs(row['profit']):,.0f} ₽".replace(",", " "))
+        else:
+            st.success("Все товары прибыльные ✅")
+    else:
+        st.info("Нет данных")
+
+with col_b:
     st.markdown("### 📦 Заканчиваются остатки")
     if not df_products.empty:
         low_stock = df_products[(df_products["stock"] > 0) & (df_products["stock"] < 10)].sort_values("stock")
@@ -308,18 +425,6 @@ with col_a:
                 st.warning(f"**{row['article']}** — {row['stock']} шт")
         else:
             st.success("Все остатки в норме ✅")
-    else:
-        st.info("Нет данных")
-
-with col_b:
-    st.markdown("### 🚨 Нет в остатках")
-    if not df_products.empty:
-        out_of_stock = df_products[df_products["stock"] == 0]
-        if len(out_of_stock) > 0:
-            for _, row in out_of_stock.head(5).iterrows():
-                st.error(f"**{row['article']}** — закончился")
-        else:
-            st.success("Все товары в наличии ✅")
     else:
         st.info("Нет данных")
 
@@ -346,12 +451,12 @@ st.subheader("📊 Сводка по дням")
 
 summary = current_period[[
     "date", "orders_count", "orders_sum", "sales_count", "sales_sum",
-    "commission", "logistics", "advertising", "profit"
+    "commission", "logistics", "cost_price", "advertising", "profit"
 ]].copy()
 
 summary.columns = [
     "Дата", "Заказы шт", "Заказы ₽", "Продажи шт", "Продажи ₽",
-    "Комиссия", "Логистика", "Реклама", "Прибыль"
+    "Комиссия", "Логистика", "Себестоимость", "Реклама", "Прибыль"
 ]
 
 st.dataframe(summary, use_container_width=True, height=400)
@@ -373,4 +478,4 @@ st.download_button(
 
 
 st.markdown("---")
-st.caption("💡 Данные обновляются раз в 10 минут. Нажми 'Обновить данные' для принудительного обновления.")
+st.caption("💡 Данные обновляются раз в 30-60 минут. Нажми 'Очистить кеш и обновить' для принудительного обновления.")
