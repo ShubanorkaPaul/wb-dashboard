@@ -82,7 +82,7 @@ def get_orders(api_key, date_from):
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_sales(api_key, date_from):
     """Получить продажи с указанной даты"""
-    time.sleep(3)  # Задержка между запросами
+    time.sleep(3)
 
     url = f"{BASE_STATISTICS}/api/v1/supplier/sales"
     params = {"dateFrom": date_from}
@@ -116,7 +116,7 @@ def get_sales(api_key, date_from):
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_stocks(api_key, date_from):
     """Получить остатки (ограничение WB: 1 запрос в минуту)"""
-    time.sleep(5)  # Пауза перед запросом остатков
+    time.sleep(5)
 
     url = f"{BASE_STATISTICS}/api/v1/supplier/stocks"
     params = {"dateFrom": date_from}
@@ -174,8 +174,8 @@ def get_advert_costs(api_key, date_from, date_to):
         return pd.DataFrame()
 
 
-def aggregate_daily_data(orders_df, sales_df, advert_df, days):
-    """Собрать данные по дням в единую таблицу"""
+def aggregate_daily_data(orders_df, sales_df, advert_df, days, cost_prices=None):
+    """Собрать данные по дням с учётом себестоимости"""
 
     end_date = datetime.now().date()
     start_date = end_date - timedelta(days=days - 1)
@@ -203,18 +203,29 @@ def aggregate_daily_data(orders_df, sales_df, advert_df, days):
 
             for_pay = day_sales["forPay"].sum() if "forPay" in day_sales.columns else 0
             commission = sales_sum - for_pay if for_pay > 0 else 0
+
+            day_cost = 0
+            if cost_prices and "supplierArticle" in day_sales.columns:
+                for _, row in day_sales.iterrows():
+                    article = str(row["supplierArticle"]).strip()
+                    if article in cost_prices:
+                        day_cost += cost_prices[article]
         else:
             sales_count = 0
             sales_sum = 0
             returns_count = 0
             returns_sum = 0
             commission = 0
+            for_pay = 0
+            day_cost = 0
 
         if not advert_df.empty and "date" in advert_df.columns:
             day_ads = advert_df[advert_df["date"] == date]
             advertising = day_ads["advertising"].sum() if len(day_ads) > 0 else 0
         else:
             advertising = 0
+
+        profit = for_pay - day_cost - advertising
 
         result.append({
             "date": date.strftime("%d.%m.%Y"),
@@ -228,21 +239,21 @@ def aggregate_daily_data(orders_df, sales_df, advert_df, days):
             "total_sum": float(sales_sum - returns_sum),
             "commission": float(commission),
             "acquiring": float(sales_sum * 0.015),
-            "to_pay": float(sales_sum - commission),
+            "to_pay": float(for_pay),
             "storage": 0,
             "logistics": float(sales_sum * 0.12),
             "acceptance": 0,
             "deductions": 0,
-            "cost_price": 0,
+            "cost_price": float(day_cost),
             "advertising": float(advertising),
-            "profit": float(sales_sum - commission - (sales_sum * 0.12) - advertising),
+            "profit": float(profit),
         })
 
     return pd.DataFrame(result)
 
 
-def aggregate_products(sales_df, stocks_df):
-    """Собрать данные по товарам"""
+def aggregate_products(sales_df, stocks_df, cost_prices=None):
+    """Собрать данные по товарам с учётом себестоимости"""
 
     if sales_df.empty:
         return pd.DataFrame()
@@ -260,6 +271,9 @@ def aggregate_products(sales_df, stocks_df):
         "revenue": ("priceWithDisc", "sum"),
     }
 
+    if "forPay" in non_returns.columns:
+        agg_dict["for_pay"] = ("forPay", "sum")
+
     if "subject" in non_returns.columns:
         agg_dict["name"] = ("subject", "first")
 
@@ -269,6 +283,9 @@ def aggregate_products(sales_df, stocks_df):
     if "name" not in grouped.columns:
         grouped["name"] = grouped["article"]
 
+    if "for_pay" not in grouped.columns:
+        grouped["for_pay"] = grouped["revenue"] * 0.75
+
     if not stocks_df.empty and "supplierArticle" in stocks_df.columns:
         stocks_grouped = stocks_df.groupby("supplierArticle")["quantity"].sum().reset_index()
         stocks_grouped.columns = ["article", "stock"]
@@ -277,15 +294,22 @@ def aggregate_products(sales_df, stocks_df):
     else:
         grouped["stock"] = 0
 
-    grouped["cost_price_total"] = 0
-    grouped["profit"] = grouped["revenue"] * 0.5
+    if cost_prices:
+        grouped["cost_per_unit"] = grouped["article"].astype(str).str.strip().map(cost_prices).fillna(0)
+    else:
+        grouped["cost_per_unit"] = 0
 
-    grouped = grouped.sort_values("revenue", ascending=False).reset_index(drop=True)
+    grouped["cost_price_total"] = grouped["cost_per_unit"] * grouped["sold"]
+    grouped["profit"] = grouped["for_pay"] - grouped["cost_price_total"]
+    grouped["has_cost"] = grouped["cost_per_unit"] > 0
 
-    return grouped[["article", "name", "sold", "revenue", "cost_price_total", "profit", "stock"]]
+    grouped = grouped.sort_values("profit", ascending=False).reset_index(drop=True)
+
+    return grouped[["article", "name", "sold", "revenue", "for_pay",
+                    "cost_per_unit", "cost_price_total", "profit", "stock", "has_cost"]]
 
 
-def load_wb_data(api_key, days):
+def load_wb_data(api_key, days, cost_prices=None):
     """Основная функция загрузки всех данных из WB"""
 
     date_from = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
@@ -303,7 +327,7 @@ def load_wb_data(api_key, days):
     with st.spinner("📣 Загружаем расходы на рекламу..."):
         advert_df = get_advert_costs(api_key, date_from, date_to)
 
-    daily = aggregate_daily_data(orders_df, sales_df, advert_df, days)
-    products = aggregate_products(sales_df, stocks_df)
+    daily = aggregate_daily_data(orders_df, sales_df, advert_df, days, cost_prices)
+    products = aggregate_products(sales_df, stocks_df, cost_prices)
 
     return daily, products
